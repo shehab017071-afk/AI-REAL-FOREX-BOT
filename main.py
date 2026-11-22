@@ -1,82 +1,68 @@
 
-
 import yfinance as yf
 import pandas as pd
-import time
 
-PAIR = "EURUSD=X"
+SYMBOL = "EURUSD=X"
 
-def analyze():
+print("AI Real Forex Bot Starting...")
+
+try:
     data = yf.download(
-        PAIR,
-        period="1d",
-        interval="1m",
-        progress=False
+        SYMBOL,
+        period="5d",
+        interval="5m",
+        progress=False,
+        auto_adjust=False
     )
 
-    if data.empty or len(data) < 60:
-        print("Waiting for market data...")
-        return
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    df = data.copy().iloc[:-1]
-
-    if len(df) < 55:
-        return
-
-    df["EMA9"] = df["Close"].ewm(span=9).mean()
-    df["EMA21"] = df["Close"].ewm(span=21).mean()
-    df["EMA50"] = df["Close"].ewm(span=50).mean()
-
-    change = df["Close"].diff()
-    gain = change.clip(lower=0)
-    loss = -change.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
-
-    up = (
-        last["EMA9"] > last["EMA21"] > last["EMA50"]
-        and last["Close"] > last["EMA9"]
-        and last["Close"] > last["Open"]
-        and 50 < last["RSI"] < 68
-    )
-
-    down = (
-        last["EMA9"] < last["EMA21"] < last["EMA50"]
-        and last["Close"] < last["EMA9"]
-        and last["Close"] < last["Open"]
-        and 32 < last["RSI"] < 50
-    )
-
-    print("\n===== REAL FOREX SIGNAL =====")
-    print("Pair:", PAIR)
-    print("Price:", round(float(last["Close"]), 5))
-    print("RSI:", round(float(last["RSI"]), 2))
-
-    if up:
-        print("SIGNAL: UP 🟢")
-        print("Expiry: Next 1-minute candle")
-    elif down:
-        print("SIGNAL: DOWN 🔴")
-        print("Expiry: Next 1-minute candle")
+    if data.empty:
+        print("ERROR: Forex data not available.")
     else:
-        print("SIGNAL: NO TRADE ⚪")
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data["Close"].iloc[:, 0]
+        else:
+            close = data["Close"]
 
-    print("=============================")
+        close = close.dropna()
 
-while True:
-    try:
-        analyze()
-    except Exception as e:
-        print("Error:", e)
+        if len(close) < 30:
+            print("Not enough market data. Try again later.")
+        else:
+            ema9 = close.ewm(span=9, adjust=False).mean()
+            ema21 = close.ewm(span=21, adjust=False).mean()
 
-    time.sleep(60)
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+
+            avg_gain = gain.ewm(
+                alpha=1/14, adjust=False, min_periods=14
+            ).mean()
+
+            avg_loss = loss.ewm(
+                alpha=1/14, adjust=False, min_periods=14
+            ).mean()
+
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+
+            price = float(close.iloc[-1])
+            fast = float(ema9.iloc[-1])
+            slow = float(ema21.iloc[-1])
+            current_rsi = float(rsi.iloc[-1])
+
+            print("Pair:", SYMBOL)
+            print("Price:", price)
+            print("RSI:", round(current_rsi, 2))
+
+            if fast > slow and 50 < current_rsi < 70:
+                print("SIGNAL: UP")
+            elif fast < slow and 30 < current_rsi < 50:
+                print("SIGNAL: DOWN")
+            else:
+                print("SIGNAL: WAIT")
+
+except Exception as e:
+    print("ERROR:", e)
+
+print("Bot finished.")
