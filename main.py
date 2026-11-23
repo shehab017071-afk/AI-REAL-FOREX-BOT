@@ -13,38 +13,90 @@ from sklearn.metrics import accuracy_score
 warnings.filterwarnings("ignore")
 
 SYMBOL = "EURUSD=X"
-
-FEATURES = [
-    "rsi", "ema_gap", "trend", "return1",
-    "return3", "momentum", "volatility",
-    "candle_body", "range_pct"
-]
+TIMEFRAME = "5m"
+PERIOD = "5d"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+FEATURES = [
+    "rsi",
+    "ema_gap",
+    "trend",
+    "return1",
+    "return3",
+    "momentum",
+    "volatility",
+    "candle_body",
+    "range_pct"
+]
+
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise ValueError("Telegram secrets are missing")
+        raise RuntimeError("Telegram secrets are missing")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    response = requests.post(
-        url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        },
-        timeout=20
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendMessage"
     )
 
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message
+            },
+            timeout=20
+        )
 
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram delivery failed")
+        result = response.json()
 
-    print("Telegram message sent successfully")
+        if response.status_code != 200 or not result.get("ok"):
+            raise RuntimeError("Telegram delivery failed")
+
+        print("Telegram message sent successfully")
+
+    except Exception:
+        raise RuntimeError("Telegram message could not be sent")
+
+
+def make_features(data):
+    close = data["Close"].astype(float)
+    high = data["High"].astype(float)
+    low = data["Low"].astype(float)
+    opening = data["Open"].astype(float)
+
+    df = pd.DataFrame(index=data.index)
+
+    change = close.diff()
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+
+    df["ema_gap"] = (ema9 - ema21) / close
+    df["trend"] = (ema9 > ema21).astype(int)
+
+    df["return1"] = close.pct_change()
+    df["return3"] = close.pct_change(3)
+
+    df["momentum"] = close - close.shift(5)
+    df["volatility"] = df["return1"].rolling(10).std()
+
+    df["candle_body"] = (close - opening) / close
+    df["range_pct"] = (high - low) / close
+
+    return df.replace([np.inf, -np.inf], np.nan)
 
 
 def main():
@@ -53,92 +105,63 @@ def main():
 
     data = yf.download(
         SYMBOL,
-        period="5d",
-        interval="5m",
+        period=PERIOD,
+        interval=TIMEFRAME,
         progress=False,
         auto_adjust=False,
         threads=False
     )
 
-    if data.empty or len(data) < 200:
-        raise ValueError("Market data unavailable or insufficient")
+    if data.empty:
+        raise RuntimeError("Market data unavailable")
 
     if isinstance(data.columns, pd.MultiIndex):
-        close = data["Close"].iloc[:, 0]
-        high = data["High"].iloc[:, 0]
-        low = data["Low"].iloc[:, 0]
-        opening = data["Open"].iloc[:, 0]
-    else:
-        close = data["Close"]
-        high = data["High"]
-        low = data["Low"]
-        opening = data["Open"]
+        data.columns = data.columns.get_level_values(0)
 
-    # Ignore the latest unfinished candle
-    close = close.iloc[:-1]
-    high = high.iloc[:-1]
-    low = low.iloc[:-1]
-    opening = opening.iloc[:-1]
+    required = ["Open", "High", "Low", "Close"]
 
-    df = pd.DataFrame({"close": close})
+    for column in required:
+        if column not in data.columns:
+            raise RuntimeError("Required market data missing")
 
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
+    data = data[required].dropna()
 
-    change = close.diff()
-    gain = change.clip(lower=0)
-    loss = -change.clip(upper=0)
+    if len(data) < 200:
+        raise RuntimeError("Not enough market data")
 
-    avg_gain = gain.ewm(
-        alpha=1/14, adjust=False, min_periods=14
-    ).mean()
+    features = make_features(data)
 
-    avg_loss = loss.ewm(
-        alpha=1/14, adjust=False, min_periods=14
-    ).mean()
+    future_return = data["Close"].shift(-3) / data["Close"] - 1
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    target = pd.Series(
+        np.select(
+            [
+                future_return > 0.00015,
+                future_return < -0.00015
+            ],
+            [1, -1],
+            default=0
+        ),
+        index=data.index
+    )
 
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["ema_gap"] = ema9 / ema21 - 1
-    df["trend"] = ema21 / ema50 - 1
-    df["return1"] = close.pct_change()
-    df["return3"] = close.pct_change(3)
-    df["momentum"] = close / close.shift(6) - 1
-    df["volatility"] = df["return1"].rolling(12).std()
-    df["candle_body"] = (close - opening) / close
-    df["range_pct"] = (high - low) / close
+    dataset = features.copy()
+    dataset["target"] = target
 
-    future_return = close.shift(-3) / close - 1
+    training = dataset.dropna().iloc[:-3].copy()
 
-    target = pd.Series(np.nan, index=df.index)
-    target.loc[future_return > 0.00015] = 1
-    target.loc[future_return < -0.00015] = -1
-    target.loc[
-        future_return.between(-0.00015, 0.00015)
-    ] = 0
+    latest = features.dropna().iloc[[-1]].copy()
 
-    training = df[FEATURES].copy()
-    training["target"] = target
-
-    training = training.replace(
-        [np.inf, -np.inf], np.nan
-    ).dropna()
-
-    latest = df[FEATURES].replace(
-        [np.inf, -np.inf], np.nan
-    ).dropna().tail(1)
-
-    if len(training) < 150 or latest.empty:
-        raise ValueError("Not enough clean market data")
+    if len(training) < 150:
+        raise RuntimeError("Not enough clean training data")
 
     split = int(len(training) * 0.8)
-    train = training.iloc[:split-3]
+
+    train = training.iloc[:split]
     test = training.iloc[split:]
 
     if len(train) < 80 or len(test) < 20:
-        raise ValueError("Insufficient validation data")
+        raise RuntimeError("Not enough validation data")
 
     model = RandomForestClassifier(
         n_estimators=300,
@@ -146,7 +169,7 @@ def main():
         min_samples_leaf=5,
         class_weight="balanced_subsample",
         random_state=42,
-        n_jobs=-1
+        n_jobs=1
     )
 
     model.fit(
@@ -166,7 +189,8 @@ def main():
         training["target"].astype(int)
     )
 
-    probabilities = model.predict_proba(latest)[0]
+    probabilities = model.predict_proba(latest[FEATURES])[0]
+
     probability_map = dict(zip(model.classes_, probabilities))
 
     up = float(probability_map.get(1, 0))
@@ -180,19 +204,22 @@ def main():
     else:
         signal = "WAIT"
 
-    price = float(close.iloc[-1])
-    candle_time = str(df.index[-1])
+    price = float(data["Close"].iloc[-1])
+    candle_time = str(data.index[-1])
 
+    print("------------------------------")
+    print("Candle:", candle_time)
+    print("Price:", price)
     print("Validation accuracy:", round(accuracy * 100, 2), "%")
-    print("UP:", round(up * 100, 2), "%")
-    print("DOWN:", round(down * 100, 2), "%")
-    print("NEUTRAL:", round(neutral * 100, 2), "%")
+    print("UP probability:", round(up * 100, 2), "%")
+    print("DOWN probability:", round(down * 100, 2), "%")
+    print("NEUTRAL probability:", round(neutral * 100, 2), "%")
     print("AI SIGNAL:", signal)
 
     message = (
-        "🤖 AI REAL FOREX BOT\n\n"
+        "🤖 AI REAL FOREX SIGNAL BOT\n\n"
         f"Pair: {SYMBOL}\n"
-        "Timeframe: 5 Minutes\n"
+        f"Timeframe: {TIMEFRAME}\n"
         "Expiry: 1 Minute (not validated)\n\n"
         f"Signal: {signal}\n"
         f"Price: {price:.5f}\n"
@@ -201,7 +228,8 @@ def main():
         f"NEUTRAL probability: {neutral * 100:.2f}%\n"
         f"Validation accuracy: {accuracy * 100:.2f}%\n"
         f"Candle: {candle_time}\n\n"
-        "Educational signal only. Not a guarantee of profit."
+        "Educational signal only.\n"
+        "Not a guarantee of profit."
     )
 
     send_telegram(message)
