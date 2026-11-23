@@ -1,10 +1,12 @@
 
+import os
 import sys
 import warnings
-
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 
@@ -16,6 +18,35 @@ FEATURES = [
     "return3", "momentum", "volatility",
     "candle_body", "range_pct"
 ]
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets are missing.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError("Telegram message was not accepted")
+
+    print("Telegram message sent successfully.")
+
 
 def main():
     print("AI MACHINE LEARNING FOREX BOT")
@@ -30,8 +61,8 @@ def main():
         threads=False
     )
 
-    if data.empty:
-        raise ValueError("Market data unavailable")
+    if data.empty or len(data) < 200:
+        raise ValueError("Market data unavailable or insufficient")
 
     if isinstance(data.columns, pd.MultiIndex):
         close = data["Close"].iloc[:, 0]
@@ -43,6 +74,12 @@ def main():
         high = data["High"]
         low = data["Low"]
         opening = data["Open"]
+
+    # Ignore the possibly unfinished latest candle
+    close = close.iloc[:-1]
+    high = high.iloc[:-1]
+    low = low.iloc[:-1]
+    opening = opening.iloc[:-1]
 
     df = pd.DataFrame({"close": close})
 
@@ -85,6 +122,7 @@ def main():
 
     training = df[FEATURES].copy()
     training["target"] = target
+
     training = training.replace(
         [np.inf, -np.inf], np.nan
     ).dropna()
@@ -118,8 +156,10 @@ def main():
     )
 
     predictions = model.predict(test[FEATURES])
+
     accuracy = accuracy_score(
-        test["target"].astype(int), predictions
+        test["target"].astype(int),
+        predictions
     )
 
     model.fit(
@@ -134,23 +174,45 @@ def main():
     down = float(probability_map.get(-1, 0))
     neutral = float(probability_map.get(0, 0))
 
+    if up >= 0.60 and up > down:
+        signal = "UP"
+    elif down >= 0.60 and down > up:
+        signal = "DOWN"
+    else:
+        signal = "WAIT"
+
+    price = float(close.iloc[-1])
+    candle_time = str(df.index[-1])
+
     print("--------------------------------")
-    print("Candle:", str(df.index[-1]))
-    print("Price:", float(close.iloc[-1]))
+    print("Candle:", candle_time)
+    print("Price:", price)
     print("Validation accuracy:", round(accuracy * 100, 2), "%")
     print("UP probability:", round(up * 100, 2), "%")
     print("DOWN probability:", round(down * 100, 2), "%")
     print("NEUTRAL probability:", round(neutral * 100, 2), "%")
-
-    if up >= 0.60 and up > down:
-        print("AI SIGNAL: UP")
-    elif down >= 0.60 and down > up:
-        print("AI SIGNAL: DOWN")
-    else:
-        print("AI SIGNAL: WAIT")
-
+    print("AI SIGNAL:", signal)
     print("--------------------------------")
+
+    message = (
+        "🤖 AI REAL FOREX SIGNAL BOT\n\n"
+        f"Pair: {SYMBOL}\n"
+        "Timeframe: 5 Minutes\n"
+        "Expiry: 1 Minute (not validated)\n\n"
+        f"Signal: {signal}\n"
+        f"Price: {price:.5f}\n"
+        f"UP probability: {up * 100:.2f}%\n"
+        f"DOWN probability: {down * 100:.2f}%\n"
+        f"NEUTRAL probability: {neutral * 100:.2f}%\n"
+        f"Validation accuracy: {accuracy * 100:.2f}%\n"
+        f"Candle: {candle_time}\n\n"
+        "⚠️ Educational signal only. "
+        "Not a guarantee of profit."
+    )
+
+    send_telegram(message)
     print("Bot finished.")
+
 
 if __name__ == "__main__":
     try:
